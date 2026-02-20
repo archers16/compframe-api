@@ -74,9 +74,14 @@ export async function runPipeline(intake, planId) {
         apiKey,
         maxTokens: 16384,
         model: MODEL_PRIMARY,
+        noRetry: true,
       })
     } catch (err) {
       console.error('[Pipeline] Analysis failed:', err.message)
+      // Log first 500 chars of response if available for debugging
+      if (err.responseText) {
+        console.error('[Pipeline] Response preview:', err.responseText.substring(0, 500))
+      }
       const isOverload = err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
 
       const retryModel = isOverload ? MODEL_FALLBACK : MODEL_PRIMARY
@@ -96,6 +101,7 @@ export async function runPipeline(intake, planId) {
           apiKey,
           maxTokens: 16384,
           model: retryModel,
+          noRetry: true,
         })
       } catch (retryErr) {
         console.error('[Pipeline] Analysis retry failed:', retryErr.message)

@@ -72,7 +72,7 @@ export async function runPipeline(intake, planId) {
         systemPrompt: buildAnalysisSystemPrompt(),
         userPrompt: buildAnalysisUserPrompt(intakeContext, metadata),
         apiKey,
-        maxTokens: 16384,
+        maxTokens: 32768,
         model: MODEL_PRIMARY,
         noRetry: true,
       })
@@ -99,7 +99,7 @@ export async function runPipeline(intake, planId) {
           systemPrompt: buildAnalysisSystemPrompt(),
           userPrompt: buildAnalysisUserPrompt(intakeContext, metadata),
           apiKey,
-          maxTokens: 16384,
+          maxTokens: 32768,
           model: retryModel,
           noRetry: true,
         })

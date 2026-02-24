@@ -113,6 +113,23 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
+    // Token budget: scale to plan count (max 25 plans per pricing)
+    // Small: 1-5 plans, Medium: 6-12 plans, Large: 13-25 plans
+    // ============================================================
+    const pc = metadata.planCount
+    const tokenBudget = {
+      phaseA:  pc <= 5 ? 8192  : pc <= 12 ? 12288 : 16384,
+      phaseB:  pc <= 5 ? 16384 : pc <= 12 ? 24576 : 32768,
+      phaseC:  pc <= 5 ? 12288 : pc <= 12 ? 16384 : 20480,
+      groupA:  pc <= 5 ? 16384 : pc <= 12 ? 24576 : 32768,
+      groupB:  8192,
+      groupC:  8192,
+      groupD:  8192,
+      groupE:  pc <= 5 ? 16384 : pc <= 12 ? 24576 : 32768,
+    }
+    console.log(`[Pipeline] Plan count: ${pc}, token tier: ${pc <= 5 ? 'small' : pc <= 12 ? 'medium' : 'large'}`)
+
+    // ============================================================
     // STEP 2: Phase A -- Strategic Foundation
     // ============================================================
     const phaseA = await runPhase({
@@ -120,7 +137,7 @@ export async function runPipeline(intake, planId) {
       systemPrompt: buildPhaseASystemPrompt(),
       userPrompt: buildPhaseAUserPrompt(intakeContext, metadata),
       apiKey,
-      maxTokens: 8192,
+      maxTokens: tokenBudget.phaseA,
       model: MODEL_PRIMARY,
       supabase,
       planId,
@@ -148,7 +165,7 @@ export async function runPipeline(intake, planId) {
       systemPrompt: buildPhaseBSystemPrompt(),
       userPrompt: buildPhaseBUserPrompt(intakeContext, phaseAOutput, metadata),
       apiKey,
-      maxTokens: metadata.planCount > 6 ? 24576 : 16384,
+      maxTokens: tokenBudget.phaseB,
       model: activeModel,
       supabase,
       planId,
@@ -190,6 +207,10 @@ export async function runPipeline(intake, planId) {
       }
     }
 
+    // Backfill computed fields that compact mode may have omitted
+    // (earnings, display fields, ramp schedules) so downstream calls have complete data
+    backfillContract(phaseBOutput.numerical_contract)
+
     // ============================================================
     // STEP 5: Phase C -- Rationale & Operations
     // ============================================================
@@ -198,7 +219,7 @@ export async function runPipeline(intake, planId) {
       systemPrompt: buildPhaseCSystemPrompt(),
       userPrompt: buildPhaseCUserPrompt(intakeContext, phaseAOutput, phaseBOutput, metadata),
       apiKey,
-      maxTokens: metadata.planCount > 6 ? 16384 : 12288,
+      maxTokens: tokenBudget.phaseC,
       model: activeModel,
       supabase,
       planId,
@@ -239,17 +260,27 @@ export async function runPipeline(intake, planId) {
     console.log(`[Pipeline] Starting ${groupIds.length} parallel group calls`)
     const groupStart = Date.now()
 
+    // Override group token limits based on plan count tier
+    const groupTokenOverrides = {
+      A: tokenBudget.groupA,
+      B: tokenBudget.groupB,
+      C: tokenBudget.groupC,
+      D: tokenBudget.groupD,
+      E: tokenBudget.groupE,
+    }
+
     const groupResults = await Promise.allSettled(
       groupIds.map(async (groupId) => {
         const group = GROUP_DEFINITIONS[groupId]
         const groupStartTime = Date.now()
+        const effectiveMaxTokens = groupTokenOverrides[groupId] || group.maxTokens
 
         try {
           const result = await callClaudeJSON({
             systemPrompt: group.buildSystemPrompt(),
             userPrompt: group.buildUserPrompt(intakeContext, analysisOutput),
             apiKey,
-            maxTokens: group.maxTokens,
+            maxTokens: effectiveMaxTokens,
             model: activeModel,
           })
 
@@ -450,6 +481,138 @@ function mergeRecommendations(analysisOutput, groups) {
 
   return recs
 }
+
+/**
+ * Backfill computed fields that compact mode may have omitted.
+ * Ensures downstream group prompts always have complete data.
+ * Mutates the contract in place.
+ */
+function backfillContract(contract) {
+  if (!contract?.roles) return
+
+  let totalOTE = 0, totalBase = 0, totalVariable = 0
+  let total80 = 0, total120 = 0, total150 = 0
+
+  for (const role of contract.roles) {
+    const hc = role.headcount || 1
+
+    // Ensure base_salary and target_variable exist
+    if (!role.base_salary && role.ote && role.base_pct) {
+      role.base_salary = Math.round(role.ote * role.base_pct / 100)
+      role.target_variable = role.ote - role.base_salary
+    }
+
+    // Backfill display fields
+    if (!role.pay_mix_display && role.base_pct != null) {
+      role.pay_mix_display = `${role.base_pct}/${role.variable_pct}`
+    }
+    if (role.measures) {
+      for (const m of role.measures) {
+        if (!m.weight_display && m.weight_pct != null) m.weight_display = `${m.weight_pct}%`
+      }
+    }
+    if (!role.quota_display && role.annual_quota) {
+      role.quota_display = `$${(role.annual_quota / 1000).toFixed(0)}K annual`
+    }
+    if (role.accelerator_tiers) {
+      for (const t of role.accelerator_tiers) {
+        if (!t.multiplier_display && t.multiplier) t.multiplier_display = `${t.multiplier}x`
+      }
+    }
+
+    // Backfill earnings calculations
+    if (!role.earnings_at_100pct && role.ote) {
+      role.earnings_at_100pct = role.ote
+    }
+    if (!role.earnings_at_80pct && role.base_salary != null && role.target_variable != null) {
+      role.earnings_at_80pct = Math.round(role.base_salary + role.target_variable * 0.80)
+    }
+    if (!role.earnings_at_120pct && role.base_salary != null && role.target_variable != null) {
+      // Find the effective multiplier at 120%
+      const mult120 = getWeightedMultiplier(role.accelerator_tiers, 120)
+      role.earnings_at_120pct = Math.round(role.base_salary + role.target_variable * 1.20 * mult120)
+    }
+    if (!role.earnings_at_150pct && role.base_salary != null && role.target_variable != null) {
+      const mult150 = getWeightedMultiplier(role.accelerator_tiers, 150)
+      role.earnings_at_150pct = Math.round(role.base_salary + role.target_variable * 1.50 * mult150)
+    }
+
+    // Backfill ramp_schedule if missing
+    if (!role.ramp_schedule && role.ramp_months) {
+      role.ramp_schedule = []
+      for (let m = 1; m <= role.ramp_months; m++) {
+        const quotaPct = Math.round((m / role.ramp_months) * 100)
+        const guaranteePct = m === role.ramp_months ? 0 : Math.round(100 - (m / role.ramp_months) * 100)
+        role.ramp_schedule.push({ month: m, quota_pct: Math.min(quotaPct, 100), guarantee_pct: Math.max(guaranteePct, 0) })
+      }
+    }
+
+    // Accumulate for company-level backfill
+    totalOTE += (role.ote || 0) * hc
+    totalBase += (role.base_salary || 0) * hc
+    totalVariable += (role.target_variable || 0) * hc
+    total80 += (role.earnings_at_80pct || 0) * hc
+    total120 += (role.earnings_at_120pct || 0) * hc
+    total150 += (role.earnings_at_150pct || 0) * hc
+  }
+
+  // Backfill company-level totals
+  if (!contract.company_level) contract.company_level = {}
+  const cl = contract.company_level
+  if (!cl.total_ote_at_target) cl.total_ote_at_target = totalOTE
+  if (!cl.total_base_salary) cl.total_base_salary = totalBase
+  if (!cl.total_variable_at_target) cl.total_variable_at_target = totalVariable
+  if (!cl.total_cost_80pct) cl.total_cost_80pct = total80
+  if (!cl.total_cost_120pct) cl.total_cost_120pct = total120
+  if (!cl.total_cost_150pct) cl.total_cost_150pct = total150
+  if (!cl.total_headcount) cl.total_headcount = contract.roles.reduce((sum, r) => sum + (r.headcount || 1), 0)
+
+  const backfilledCount = contract.roles.filter(r => !r._was_complete).length
+  if (backfilledCount > 0) {
+    console.log(`[Pipeline] Backfilled computed fields for ${contract.roles.length} roles`)
+  }
+}
+
+/**
+ * Calculate weighted effective multiplier at a given attainment percentage.
+ * Walks through accelerator tiers to compute blended rate.
+ */
+function getWeightedMultiplier(tiers, attainmentPct) {
+  if (!tiers?.length) return 1.0
+
+  // Below first tier threshold, rate is 1.0x
+  let totalWeightedPay = 0
+  let prevThreshold = 0
+
+  // Add base performance (0-100%) at 1.0x
+  const aboveTarget = attainmentPct - 100
+  if (aboveTarget <= 0) return 1.0
+
+  // Sort tiers by min_attainment
+  const sorted = [...tiers].sort((a, b) => a.min_attainment_pct - b.min_attainment_pct)
+
+  let remaining = aboveTarget
+  let weightedSum = 0
+
+  for (const tier of sorted) {
+    const tierStart = tier.min_attainment_pct - 100
+    const tierEnd = tier.max_attainment_pct ? tier.max_attainment_pct - 100 : remaining + tierStart
+    const tierWidth = Math.min(remaining, tierEnd - tierStart)
+    if (tierWidth <= 0) continue
+    weightedSum += tierWidth * tier.multiplier
+    remaining -= tierWidth
+    if (remaining <= 0) break
+  }
+
+  // If there's remaining above all defined tiers, use last tier's multiplier
+  if (remaining > 0 && sorted.length > 0) {
+    weightedSum += remaining * sorted[sorted.length - 1].multiplier
+  }
+
+  // The effective multiplier on the above-target portion
+  return aboveTarget > 0 ? weightedSum / aboveTarget : 1.0
+}
+
 
 function buildFallbackRoles(contract) {
   if (!contract?.roles) return {}

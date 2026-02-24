@@ -92,7 +92,7 @@ function getTokenBudgets(planCount) {
     return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
   } else {
     // Small tier: 1-2 plans
-    return { phaseA: 12288, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
+    return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
   }
 }
 
@@ -169,6 +169,13 @@ export async function runPipeline(intake, planId) {
       hasVariants: intake._has_variants || false,
       planCount,
     }
+
+    // Debug: log intake structure for plan count troubleshooting
+    const intakeKeys = Object.keys(intake).filter(k => !k.startsWith('_')).slice(0, 30)
+    console.log(`[Pipeline] Intake keys (first 30): ${intakeKeys.join(', ')}`)
+    console.log(`[Pipeline] _plan_count: ${intake._plan_count}, combos: ${combos.length}, roles array: ${Array.isArray(intake.roles) ? intake.roles.length : 'N/A'}`)
+    const roleKeyMatches = Object.keys(intake).filter(k => /^role_\d+/.test(k))
+    console.log(`[Pipeline] Role-like keys: ${roleKeyMatches.length > 0 ? roleKeyMatches.join(', ') : 'none'}`)
 
     console.log(`[Pipeline] Plan count: ${metadata.planCount}, multi-segment: ${metadata.isMultiSegment}, variants: ${metadata.hasVariants}`)
 

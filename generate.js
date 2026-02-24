@@ -74,11 +74,11 @@ function estimatePlanCount(intake) {
 }
 
 /**
- * Token budgets. Set to max supported output (65,536) for all phases.
+ * Token budgets. Set to max supported output (64,000) for all phases.
  * Claude stops when done; you only pay for tokens actually generated.
  */
 function getTokenBudgets() {
-  return { phaseA: 65536, phaseB: 65536, phaseC: 65536, groupA: 65536, groupE: 65536 }
+  return { phaseA: 64000, phaseB: 64000, phaseC: 64000, groupA: 64000, groupE: 64000 }
 }
 
 /**
@@ -166,7 +166,7 @@ export async function runPipeline(intake, planId) {
     console.log(`[Pipeline] Plan count: ${metadata.planCount}, multi-segment: ${metadata.isMultiSegment}, variants: ${metadata.hasVariants}`)
 
     const tokenBudgets = getTokenBudgets()
-    console.log(`[Pipeline] Token budgets: all phases 65536 (max output)`)
+    console.log(`[Pipeline] Token budgets: all phases 64000 (max output)`)
 
     // ============================================================
     // STEP 2: Phase A -- Strategic Foundation

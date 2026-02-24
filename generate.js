@@ -40,18 +40,58 @@ async function updateStatus(supabase, planId, stage, detail) {
 }
 
 /**
+ * Estimate plan count from intake data.
+ * Tries multiple approaches since _plan_count metadata may not be set.
+ */
+function estimatePlanCount(intake) {
+  // 1. Explicit metadata
+  if (intake._plan_count && intake._plan_count > 0) return intake._plan_count
+
+  // 2. Combo details array
+  if (intake._combo_details?.length > 0) return intake._combo_details.length
+
+  // 3. Count roles array if present
+  if (Array.isArray(intake.roles)) return Math.max(intake.roles.length, 1)
+  if (Array.isArray(intake.plans)) return Math.max(intake.plans.length, 1)
+
+  // 4. Count role-like keys (role_1, role_2, etc.)
+  const roleKeys = Object.keys(intake).filter(k => /^role_\d+/.test(k))
+  if (roleKeys.length > 0) return roleKeys.length
+
+  // 5. Scan for roles in nested objects
+  for (const key of Object.keys(intake)) {
+    const val = intake[key]
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      if (Array.isArray(val.roles)) return Math.max(val.roles.length, 1)
+    }
+  }
+
+  // 6. Count occurrences of role-segment patterns in stringified data
+  try {
+    const str = JSON.stringify(intake)
+    const matches = str.match(/"role_key"\s*:/g) || str.match(/"role_name"\s*:/g) || []
+    if (matches.length > 0) return matches.length
+  } catch (e) { /* ignore */ }
+
+  return 1
+}
+
+/**
  * Centralized token budget calculator.
  * Three tiers: small (1-5 plans), medium (6-12), large (13-25).
  */
 function getTokenBudgets(planCount) {
   if (planCount > 12) {
     // Large tier: 13-25 plans
-    return { phaseA: 24576, phaseB: 32768, phaseC: 20480, groupA: 32768, groupE: 32768 }
+    return { phaseA: 32768, phaseB: 32768, phaseC: 20480, groupA: 32768, groupE: 32768 }
   } else if (planCount > 5) {
     // Medium tier: 6-12 plans
-    return { phaseA: 16384, phaseB: 24576, phaseC: 16384, groupA: 24576, groupE: 24576 }
+    return { phaseA: 24576, phaseB: 24576, phaseC: 16384, groupA: 24576, groupE: 24576 }
+  } else if (planCount > 2) {
+    // Mid-small tier: 3-5 plans
+    return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
   } else {
-    // Small tier: 1-5 plans
+    // Small tier: 1-2 plans
     return { phaseA: 12288, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
   }
 }
@@ -123,16 +163,17 @@ export async function runPipeline(intake, planId) {
     const intakeContext = buildUserPrompt(intake)
 
     const combos = intake._combo_details || []
+    const planCount = estimatePlanCount(intake)
     const metadata = {
       isMultiSegment: intake._is_multi_segment || false,
       hasVariants: intake._has_variants || false,
-      planCount: intake._plan_count || combos.length || 1,
+      planCount,
     }
 
     console.log(`[Pipeline] Plan count: ${metadata.planCount}, multi-segment: ${metadata.isMultiSegment}, variants: ${metadata.hasVariants}`)
 
     const tokenBudgets = getTokenBudgets(metadata.planCount)
-    const tier = metadata.planCount > 12 ? 'large' : metadata.planCount > 5 ? 'medium' : 'small'
+    const tier = metadata.planCount > 12 ? 'large' : metadata.planCount > 5 ? 'medium' : metadata.planCount > 2 ? 'mid-small' : 'small'
     console.log(`[Pipeline] Token tier: ${tier} (Phase A: ${tokenBudgets.phaseA}, Phase B: ${tokenBudgets.phaseB}, Phase C: ${tokenBudgets.phaseC})`)
 
     // ============================================================

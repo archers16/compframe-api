@@ -1,15 +1,18 @@
-// CompFrame AI Pipeline - Unified (Railway)
-// No timeout constraints. Runs the full pipeline in one pass:
-//   1. Analysis Layer (strategic decisions + numerical contract)
-//   2. Contract Validation + Auto-Fix
-//   3. 5 Parallel Group Calls (formatting analysis into deliverables)
-//   4. Group Output Validation + Force-Align
-//   5. Merge into final recommendations JSON
-//   6. Save to Supabase
+// CompFrame AI Pipeline - Decomposed Analysis (Railway)
+// No timeout constraints. Runs the full pipeline:
+//   Phase A: Strategic Foundation (qualitative decisions)
+//   Phase B: Numerical Contract (all numbers locked)
+//   Phase C: Rationale & Operations (explanations + operational design)
+//   Validation + Auto-Fix
+//   5 Parallel Group Calls (formatting into deliverables)
+//   Group Validation + Force-Align
+//   Merge + Save to Supabase
 
 import { createClient } from '@supabase/supabase-js'
 import { callClaudeJSON } from './lib/claude.js'
-import { buildAnalysisSystemPrompt, buildAnalysisUserPrompt } from './lib/analysis-prompt.js'
+import { buildPhaseASystemPrompt, buildPhaseAUserPrompt } from './lib/phase-a-prompt.js'
+import { buildPhaseBSystemPrompt, buildPhaseBUserPrompt } from './lib/phase-b-prompt.js'
+import { buildPhaseCSystemPrompt, buildPhaseCUserPrompt } from './lib/phase-c-prompt.js'
 import { GROUP_DEFINITIONS } from './lib/group-prompts.js'
 import { validateContract, autoFixContract, validateGroupOutput, forceAlignGroupA } from './lib/validation.js'
 import { buildUserPrompt } from './lib/user-prompt.js'
@@ -36,6 +39,59 @@ async function updateStatus(supabase, planId, stage, detail) {
   }
 }
 
+/**
+ * Run a single phase with retry logic.
+ * Returns { output, activeModel, ms }
+ */
+async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, model, supabase, planId, stage, detail, retryDetail }) {
+  await updateStatus(supabase, planId, stage, detail)
+  console.log(`[Pipeline] Starting ${name}`)
+  const start = Date.now()
+
+  let output
+  let activeModel = model
+
+  try {
+    output = await callClaudeJSON({
+      systemPrompt,
+      userPrompt,
+      apiKey,
+      maxTokens,
+      model,
+      noRetry: true,
+    })
+  } catch (err) {
+    console.error(`[Pipeline] ${name} failed:`, err.message)
+    if (err.responseText) {
+      console.error(`[Pipeline] ${name} response preview:`, err.responseText.substring(0, 500))
+    }
+
+    const isOverload = err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
+    const retryModel = isOverload ? MODEL_FALLBACK : model
+    activeModel = retryModel
+
+    await updateStatus(supabase, planId, stage, retryDetail || `${name} failed. Retrying...`)
+
+    try {
+      output = await callClaudeJSON({
+        systemPrompt,
+        userPrompt,
+        apiKey,
+        maxTokens,
+        model: retryModel,
+        noRetry: true,
+      })
+    } catch (retryErr) {
+      console.error(`[Pipeline] ${name} retry failed:`, retryErr.message)
+      throw new Error(`${name} failed after retry`)
+    }
+  }
+
+  const ms = Date.now() - start
+  console.log(`[Pipeline] ${name} complete in ${(ms / 1000).toFixed(1)}s`)
+  return { output, activeModel, ms }
+}
+
 export async function runPipeline(intake, planId) {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) throw new Error('API key not configured')
@@ -57,91 +113,66 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
-    // STEP 2: Analysis Layer
+    // STEP 2: Phase A -- Strategic Foundation
     // ============================================================
-    await updateStatus(supabase, planId, 'analysis', 'Analyzing compensation structure across 21 modules...')
+    const phaseA = await runPhase({
+      name: 'Phase A (Strategic Foundation)',
+      systemPrompt: buildPhaseASystemPrompt(),
+      userPrompt: buildPhaseAUserPrompt(intakeContext, metadata),
+      apiKey,
+      maxTokens: 8192,
+      model: MODEL_PRIMARY,
+      supabase,
+      planId,
+      stage: 'analysis',
+      detail: 'Phase 1/3: Analyzing strategy and role architecture...',
+      retryDetail: 'Strategy analysis failed. Retrying...',
+    })
 
-    console.log(`[Pipeline] Starting analysis for plan ${planId} (${metadata.planCount} plans)`)
-    const analysisStart = Date.now()
+    const phaseAOutput = phaseA.output
+    let activeModel = phaseA.activeModel
 
-    let analysisOutput
-    let activeModel = MODEL_PRIMARY
-
-    try {
-      analysisOutput = await callClaudeJSON({
-        systemPrompt: buildAnalysisSystemPrompt(),
-        userPrompt: buildAnalysisUserPrompt(intakeContext, metadata),
-        apiKey,
-        maxTokens: 32768,
-        model: MODEL_PRIMARY,
-        noRetry: true,
-      })
-    } catch (err) {
-      console.error('[Pipeline] Analysis failed:', err.message)
-      // Log first 500 chars of response if available for debugging
-      if (err.responseText) {
-        console.error('[Pipeline] Response preview:', err.responseText.substring(0, 500))
-      }
-      const isOverload = err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
-
-      const retryModel = isOverload ? MODEL_FALLBACK : MODEL_PRIMARY
-      activeModel = retryModel
-
-      if (isOverload) {
-        console.log('[Pipeline] Primary model overloaded, falling back')
-        await updateStatus(supabase, planId, 'analysis', 'Primary model busy, using backup model...')
-      } else {
-        await updateStatus(supabase, planId, 'analysis', 'Analysis failed. Retrying...')
-      }
-
-      try {
-        analysisOutput = await callClaudeJSON({
-          systemPrompt: buildAnalysisSystemPrompt(),
-          userPrompt: buildAnalysisUserPrompt(intakeContext, metadata),
-          apiKey,
-          maxTokens: 32768,
-          model: retryModel,
-          noRetry: true,
-        })
-      } catch (retryErr) {
-        console.error('[Pipeline] Analysis retry failed:', retryErr.message)
-        if (planId && supabase) {
-          try {
-            await supabase.from('plans').update({
-              status: 'error',
-              generation_stage: 'error',
-              generation_detail: 'Analysis phase failed after retry. Please try again.',
-            }).eq('id', planId)
-          } catch (_) {}
-        }
-        throw new Error('Analysis phase failed after retry')
-      }
+    // Validate Phase A
+    if (!phaseAOutput?.strategic_analysis || !phaseAOutput?.role_architecture?.roles?.length) {
+      console.error('[Pipeline] Phase A missing required fields:', Object.keys(phaseAOutput || {}))
+      throw new Error('Phase A produced incomplete output (missing strategic_analysis or role_architecture)')
     }
 
-    const analysisMs = Date.now() - analysisStart
-    console.log(`[Pipeline] Analysis complete in ${(analysisMs / 1000).toFixed(1)}s`)
-
-    // Validate structure
-    if (!analysisOutput?.numerical_contract || !analysisOutput?.strategic_analysis) {
-      console.error('[Pipeline] Analysis missing required fields:', Object.keys(analysisOutput || {}))
-      if (planId && supabase) {
-        try {
-          await supabase.from('plans').update({
-            status: 'error',
-            generation_stage: 'error',
-            generation_detail: 'Analysis produced incomplete output. Please try again.',
-          }).eq('id', planId)
-        } catch (_) {}
-      }
-      throw new Error('Analysis produced incomplete output')
-    }
+    console.log(`[Pipeline] Phase A produced ${phaseAOutput.role_architecture.roles.length} role(s)`)
 
     // ============================================================
-    // STEP 3: Validate and auto-fix the numerical contract
+    // STEP 3: Phase B -- Numerical Contract
+    // ============================================================
+    const phaseB = await runPhase({
+      name: 'Phase B (Numerical Contract)',
+      systemPrompt: buildPhaseBSystemPrompt(),
+      userPrompt: buildPhaseBUserPrompt(intakeContext, phaseAOutput, metadata),
+      apiKey,
+      maxTokens: metadata.planCount > 6 ? 24576 : 16384,
+      model: activeModel,
+      supabase,
+      planId,
+      stage: 'analysis',
+      detail: 'Phase 2/3: Locking numerical contract...',
+      retryDetail: 'Numerical contract failed. Retrying...',
+    })
+
+    const phaseBOutput = phaseB.output
+
+    // Validate Phase B
+    if (!phaseBOutput?.numerical_contract?.roles?.length) {
+      console.error('[Pipeline] Phase B missing numerical_contract.roles:', Object.keys(phaseBOutput || {}))
+      throw new Error('Phase B produced incomplete output (missing numerical_contract)')
+    }
+
+    console.log(`[Pipeline] Phase B produced ${phaseBOutput.numerical_contract.roles.length} role(s) in contract`)
+
+    // ============================================================
+    // STEP 4: Validate and auto-fix the numerical contract
     // ============================================================
     await updateStatus(supabase, planId, 'validation', 'Validating numerical contract...')
 
-    const contractValidation = validateContract(analysisOutput.numerical_contract)
+    const contractValidation = validateContract(phaseBOutput.numerical_contract)
     console.log(`[Pipeline] Contract validation: ${contractValidation.valid ? 'PASSED' : 'FAILED'} (${contractValidation.errors.length} errors, ${contractValidation.warnings.length} warnings)`)
 
     if (contractValidation.errors.length > 0) {
@@ -150,9 +181,9 @@ export async function runPipeline(intake, planId) {
 
     if (!contractValidation.valid) {
       console.log('[Pipeline] Auto-fixing contract...')
-      analysisOutput.numerical_contract = autoFixContract(analysisOutput.numerical_contract)
+      phaseBOutput.numerical_contract = autoFixContract(phaseBOutput.numerical_contract)
 
-      const revalidation = validateContract(analysisOutput.numerical_contract)
+      const revalidation = validateContract(phaseBOutput.numerical_contract)
       console.log(`[Pipeline] Post-fix validation: ${revalidation.valid ? 'PASSED' : 'STILL HAS ERRORS'}`)
       if (!revalidation.valid) {
         console.warn('[Pipeline] Remaining errors after auto-fix:', revalidation.errors.map(e => e.message))
@@ -160,7 +191,47 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
-    // STEP 4: Parallel group generation
+    // STEP 5: Phase C -- Rationale & Operations
+    // ============================================================
+    const phaseC = await runPhase({
+      name: 'Phase C (Rationale & Operations)',
+      systemPrompt: buildPhaseCSystemPrompt(),
+      userPrompt: buildPhaseCUserPrompt(intakeContext, phaseAOutput, phaseBOutput, metadata),
+      apiKey,
+      maxTokens: metadata.planCount > 6 ? 16384 : 12288,
+      model: activeModel,
+      supabase,
+      planId,
+      stage: 'analysis',
+      detail: 'Phase 3/3: Building rationale and operations...',
+      retryDetail: 'Rationale phase failed. Retrying...',
+    })
+
+    const phaseCOutput = phaseC.output
+
+    if (!phaseCOutput?.role_analysis || !phaseCOutput?.operational_analysis) {
+      console.warn('[Pipeline] Phase C missing some fields:', Object.keys(phaseCOutput || {}))
+    }
+
+    const totalAnalysisMs = phaseA.ms + phaseB.ms + phaseC.ms
+    console.log(`[Pipeline] All analysis phases complete in ${(totalAnalysisMs / 1000).toFixed(1)}s (A: ${(phaseA.ms / 1000).toFixed(1)}s, B: ${(phaseB.ms / 1000).toFixed(1)}s, C: ${(phaseC.ms / 1000).toFixed(1)}s)`)
+
+    // ============================================================
+    // STEP 6: Merge phase outputs into unified analysisOutput
+    // (matches the shape group prompts expect)
+    // ============================================================
+    const analysisOutput = {
+      numerical_contract: phaseBOutput.numerical_contract,
+      strategic_analysis: phaseAOutput.strategic_analysis,
+      role_analysis: phaseCOutput?.role_analysis || {},
+      operational_analysis: phaseCOutput?.operational_analysis || {},
+      scenarios: phaseCOutput?.scenarios || [],
+      global_warnings: phaseCOutput?.global_warnings || [],
+      assumptions: phaseCOutput?.assumptions || [],
+    }
+
+    // ============================================================
+    // STEP 7: Parallel group generation
     // ============================================================
     await updateStatus(supabase, planId, 'generating', 'Building plan deliverables...')
 
@@ -197,7 +268,7 @@ export async function runPipeline(intake, planId) {
     console.log(`[Pipeline] All groups complete in ${(groupMs / 1000).toFixed(1)}s`)
 
     // ============================================================
-    // STEP 5: Collect results, retry failures
+    // STEP 8: Collect results, retry failures
     // ============================================================
     const successfulGroups = {}
     const failedGroupIds = []
@@ -239,7 +310,7 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
-    // STEP 6: Validate group outputs
+    // STEP 9: Validate group outputs
     // ============================================================
     await updateStatus(supabase, planId, 'validation', 'Running consistency checks...')
 
@@ -257,17 +328,17 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
-    // STEP 7: Merge into final recommendations
+    // STEP 10: Merge into final recommendations
     // ============================================================
     await updateStatus(supabase, planId, 'finalizing', 'Assembling final plan...')
 
     const recommendations = mergeRecommendations(analysisOutput, successfulGroups)
 
     // ============================================================
-    // STEP 8: Save to Supabase
+    // STEP 11: Save to Supabase
     // ============================================================
     const totalMs = Date.now() - pipelineStart
-    console.log(`[Pipeline] Total time: ${(totalMs / 1000).toFixed(1)}s (analysis: ${(analysisMs / 1000).toFixed(1)}s, groups: ${(groupMs / 1000).toFixed(1)}s)`)
+    console.log(`[Pipeline] Total time: ${(totalMs / 1000).toFixed(1)}s (analysis: ${(totalAnalysisMs / 1000).toFixed(1)}s, groups: ${(groupMs / 1000).toFixed(1)}s)`)
     console.log(`[Pipeline] Groups completed: ${recommendations._groups_completed.join(', ')}`)
     if (recommendations._groups_failed.length > 0) {
       console.warn(`[Pipeline] Groups failed: ${recommendations._groups_failed.join(', ')}`)
@@ -369,7 +440,7 @@ function mergeRecommendations(analysisOutput, groups) {
   }
 
   recs._numerical_contract = contract
-  recs._pipeline_version = 2
+  recs._pipeline_version = 3
   recs._groups_completed = Object.keys(groups)
   recs._groups_failed = Object.keys(GROUP_DEFINITIONS).filter(g => !groups[g])
 

@@ -50,30 +50,27 @@ function estimatePlanCount(intake) {
   // 2. Combo details array
   if (intake._combo_details?.length > 0) return intake._combo_details.length
 
-  // 3. Count roles array if present
-  if (Array.isArray(intake.roles)) return Math.max(intake.roles.length, 1)
-  if (Array.isArray(intake.plans)) return Math.max(intake.plans.length, 1)
-
-  // 4. Count role-like keys (role_1, role_2, etc.)
-  const roleKeys = Object.keys(intake).filter(k => /^role_\d+/.test(k))
-  if (roleKeys.length > 0) return roleKeys.length
-
-  // 5. Scan for roles in nested objects
-  for (const key of Object.keys(intake)) {
-    const val = intake[key]
-    if (val && typeof val === 'object' && !Array.isArray(val)) {
-      if (Array.isArray(val.roles)) return Math.max(val.roles.length, 1)
-    }
+  // 3. Count from role_types field (common intake pattern)
+  let roleCount = 1
+  if (typeof intake.role_types === 'string' && intake.role_types.length > 0) {
+    roleCount = intake.role_types.split(',').map(s => s.trim()).filter(Boolean).length
+  } else if (Array.isArray(intake.role_types)) {
+    roleCount = intake.role_types.length
+  } else if (Array.isArray(intake.roles)) {
+    roleCount = intake.roles.length
   }
 
-  // 6. Count occurrences of role-segment patterns in stringified data
-  try {
-    const str = JSON.stringify(intake)
-    const matches = str.match(/"role_key"\s*:/g) || str.match(/"role_name"\s*:/g) || []
-    if (matches.length > 0) return matches.length
-  } catch (e) { /* ignore */ }
+  // 4. Count segments
+  let segmentCount = 1
+  if (typeof intake.segments === 'string' && intake.segments.length > 0) {
+    segmentCount = intake.segments.split(',').map(s => s.trim()).filter(Boolean).length
+  } else if (Array.isArray(intake.segments)) {
+    segmentCount = intake.segments.length
+  }
 
-  return 1
+  const estimated = Math.max(roleCount, 1) * Math.max(segmentCount > 1 ? segmentCount : 1, 1)
+  console.log(`[Pipeline] estimatePlanCount: roleCount=${roleCount}, segmentCount=${segmentCount}, estimated=${estimated}`)
+  return Math.max(estimated, 1)
 }
 
 /**
@@ -83,13 +80,13 @@ function estimatePlanCount(intake) {
 function getTokenBudgets(planCount) {
   if (planCount > 12) {
     // Large tier: 13-25 plans
-    return { phaseA: 32768, phaseB: 32768, phaseC: 20480, groupA: 32768, groupE: 32768 }
+    return { phaseA: 40960, phaseB: 32768, phaseC: 20480, groupA: 32768, groupE: 32768 }
   } else if (planCount > 5) {
     // Medium tier: 6-12 plans
-    return { phaseA: 24576, phaseB: 24576, phaseC: 16384, groupA: 24576, groupE: 24576 }
+    return { phaseA: 32768, phaseB: 24576, phaseC: 16384, groupA: 24576, groupE: 24576 }
   } else if (planCount > 2) {
     // Mid-small tier: 3-5 plans
-    return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
+    return { phaseA: 24576, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
   } else {
     // Small tier: 1-2 plans
     return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
@@ -164,8 +161,9 @@ export async function runPipeline(intake, planId) {
 
     const combos = intake._combo_details || []
     const planCount = estimatePlanCount(intake)
+    const isMultiSegment = intake._is_multi_segment || intake.has_segments === 'yes' || intake.has_segments === true || (typeof intake.segments === 'string' && intake.segments.includes(','))
     const metadata = {
-      isMultiSegment: intake._is_multi_segment || false,
+      isMultiSegment,
       hasVariants: intake._has_variants || false,
       planCount,
     }

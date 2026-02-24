@@ -74,23 +74,11 @@ function estimatePlanCount(intake) {
 }
 
 /**
- * Centralized token budget calculator.
- * Three tiers: small (1-5 plans), medium (6-12), large (13-25).
+ * Token budgets. Set to max supported output (65,536) for all phases.
+ * Claude stops when done; you only pay for tokens actually generated.
  */
-function getTokenBudgets(planCount) {
-  if (planCount > 12) {
-    // Large tier: 13-25 plans
-    return { phaseA: 40960, phaseB: 32768, phaseC: 20480, groupA: 32768, groupE: 32768 }
-  } else if (planCount > 5) {
-    // Medium tier: 6-12 plans
-    return { phaseA: 32768, phaseB: 24576, phaseC: 16384, groupA: 24576, groupE: 24576 }
-  } else if (planCount > 2) {
-    // Mid-small tier: 3-5 plans
-    return { phaseA: 24576, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
-  } else {
-    // Small tier: 1-2 plans
-    return { phaseA: 16384, phaseB: 16384, phaseC: 12288, groupA: 16384, groupE: 16384 }
-  }
+function getTokenBudgets() {
+  return { phaseA: 65536, phaseB: 65536, phaseC: 65536, groupA: 65536, groupE: 65536 }
 }
 
 /**
@@ -177,9 +165,8 @@ export async function runPipeline(intake, planId) {
 
     console.log(`[Pipeline] Plan count: ${metadata.planCount}, multi-segment: ${metadata.isMultiSegment}, variants: ${metadata.hasVariants}`)
 
-    const tokenBudgets = getTokenBudgets(metadata.planCount)
-    const tier = metadata.planCount > 12 ? 'large' : metadata.planCount > 5 ? 'medium' : metadata.planCount > 2 ? 'mid-small' : 'small'
-    console.log(`[Pipeline] Token tier: ${tier} (Phase A: ${tokenBudgets.phaseA}, Phase B: ${tokenBudgets.phaseB}, Phase C: ${tokenBudgets.phaseC})`)
+    const tokenBudgets = getTokenBudgets()
+    console.log(`[Pipeline] Token budgets: all phases 65536 (max output)`)
 
     // ============================================================
     // STEP 2: Phase A -- Strategic Foundation

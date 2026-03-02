@@ -17,7 +17,7 @@ import { GROUP_DEFINITIONS } from './lib/group-prompts.js'
 import { validateContract, autoFixContract, validateGroupOutput, forceAlignGroupA } from './lib/validation.js'
 import { buildUserPrompt } from './lib/user-prompt.js'
 
-const MODEL_PRIMARY = 'claude-sonnet-4-5-20250929'
+const MODEL_PRIMARY = 'claude-sonnet-4-6'
 const MODEL_FALLBACK = 'claude-sonnet-4-5-20250929'
 
 function getSupabase() {
@@ -108,9 +108,10 @@ async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, mod
       console.error(`[Pipeline] ${name} response preview:`, err.responseText.substring(0, 500))
     }
 
-    const isOverload = err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
+    const isOverload = err.statusCode === 529 || err.statusCode === 429 || err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
     const retryModel = isOverload ? MODEL_FALLBACK : model
     activeModel = retryModel
+    console.log(`[Pipeline] Retrying ${name} with model ${retryModel} (overload: ${isOverload})`)
 
     await updateStatus(supabase, planId, stage, retryDetail || `${name} failed. Retrying...`)
 

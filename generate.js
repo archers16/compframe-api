@@ -87,6 +87,7 @@ function getTokenBudgets(planCount) {
     phaseC: 32000,
     groupDefault: 8192,
     groupA: 16384,
+    groupD: 16384,
     groupE: 16384,
   }
 
@@ -96,6 +97,7 @@ function getTokenBudgets(planCount) {
     budgets.phaseB = 48000
     budgets.phaseC = 48000
     budgets.groupA = 32000
+    budgets.groupD = 32000
     budgets.groupE = 32000
   }
 
@@ -103,6 +105,7 @@ function getTokenBudgets(planCount) {
     budgets.phaseB = 64000
     budgets.phaseC = 64000
     budgets.groupA = 48000
+    budgets.groupD = 48000
     budgets.groupE = 48000
   }
 
@@ -318,10 +321,16 @@ export async function runPipeline(intake, planId) {
     // ============================================================
     // STEP 7: SEQUENTIAL group generation
     // Groups run one at a time to avoid rate limits and reduce
-    // peak token usage. Each group only receives the analysis
-    // sections it needs (trimming happens in group-prompts.js).
+    // peak token usage. Groups receive a COMPACT intake summary
+    // instead of the full intake context (saves ~5K tokens per call).
+    // The analysis output already incorporates all intake data.
     // ============================================================
     await updateStatus(supabase, planId, 'generating', 'Building plan deliverables...')
+
+    // Build a compact intake summary for group calls (~500 chars vs ~20K chars)
+    // Groups format already-analyzed data; they don't need the full raw intake.
+    const intakeCompact = buildCompactIntakeSummary(intake)
+    console.log(`[Pipeline] Compact intake summary: ${intakeCompact.length} chars (full was ${intakeContext.length} chars, ${Math.round((1 - intakeCompact.length / intakeContext.length) * 100)}% reduction)`)
 
     const groupIds = Object.keys(GROUP_DEFINITIONS)
     console.log(`[Pipeline] Starting ${groupIds.length} SEQUENTIAL group calls`)
@@ -330,9 +339,17 @@ export async function runPipeline(intake, planId) {
     const successfulGroups = {}
     const failedGroupIds = []
 
+    // Token budget lookup for each group
+    const groupTokenBudget = (gid) => {
+      if (gid === 'A') return tokenBudgets.groupA
+      if (gid === 'D') return tokenBudgets.groupD || 16384
+      if (gid === 'E') return tokenBudgets.groupE
+      return tokenBudgets.groupDefault
+    }
+
     for (const groupId of groupIds) {
       const group = GROUP_DEFINITIONS[groupId]
-      const maxTokens = (groupId === 'A' ? tokenBudgets.groupA : groupId === 'E' ? tokenBudgets.groupE : tokenBudgets.groupDefault) || group.maxTokens
+      const maxTokens = groupTokenBudget(groupId) || group.maxTokens
       const groupStartTime = Date.now()
 
       await updateStatus(supabase, planId, 'generating', `Building ${group.name} (${groupIds.indexOf(groupId) + 1}/${groupIds.length})...`)
@@ -340,7 +357,7 @@ export async function runPipeline(intake, planId) {
       try {
         const result = await callClaudeJSON({
           systemPrompt: group.buildSystemPrompt(),
-          userPrompt: group.buildUserPrompt(intakeContext, analysisOutput),
+          userPrompt: group.buildUserPrompt(intakeCompact, analysisOutput),
           apiKey,
           maxTokens,
           model: activeModel,
@@ -369,12 +386,12 @@ export async function runPipeline(intake, planId) {
       for (const groupId of failedGroupIds) {
         const group = GROUP_DEFINITIONS[groupId]
         if (!group) continue
-        const maxTokens = (groupId === 'A' ? tokenBudgets.groupA : groupId === 'E' ? tokenBudgets.groupE : tokenBudgets.groupDefault) || group.maxTokens
+        const maxTokens = groupTokenBudget(groupId) || group.maxTokens
 
         try {
           const retryResult = await callClaudeJSON({
             systemPrompt: group.buildSystemPrompt(),
-            userPrompt: group.buildUserPrompt(intakeContext, analysisOutput),
+            userPrompt: group.buildUserPrompt(intakeCompact, analysisOutput),
             apiKey,
             maxTokens,
             model: activeModel,
@@ -453,6 +470,39 @@ export async function runPipeline(intake, planId) {
     }
     throw err
   }
+}
+
+
+/**
+ * Build a compact intake summary for group calls.
+ * Groups format already-analyzed data; they don't need the full 20K-char intake context.
+ * The analysis output already incorporates all intake decisions.
+ * This reduces each group call's input by ~5K tokens (25K total across 5 groups).
+ */
+function buildCompactIntakeSummary(intake) {
+  const lines = []
+  lines.push(`Company Stage: ${intake.funding_stage || intake.company_stage || 'Not specified'}`)
+  lines.push(`Industry: ${intake.industry || intake.industry_vertical || 'Not specified'}`)
+  lines.push(`Team Size: ${intake.team_size || 'Not specified'}`)
+  const roles = Array.isArray(intake.role_types) ? intake.role_types.join(', ') : (intake.role_types || 'Not specified')
+  lines.push(`Roles: ${roles}`)
+  lines.push(`Deal Size: ${intake.deal_size || 'Not specified'}`)
+  lines.push(`Sales Cycle: ${intake.sales_cycle || 'Not specified'}`)
+  lines.push(`Revenue Model: ${intake.deal_structure || intake.product_type || 'Not specified'}`)
+  lines.push(`Sales Motion: ${intake.sales_motion || intake.buying_motion || 'Not specified'}`)
+  lines.push(`Plan Status: ${intake.plan_status || 'Not specified'}`)
+  if (intake.primary_goal) lines.push(`Primary Goal: ${intake.primary_goal}`)
+  if (intake.comp_positioning) lines.push(`Comp Positioning: ${intake.comp_positioning}`)
+  if (intake.revenue_focus || intake.revenue_mix) lines.push(`Revenue Focus: ${intake.revenue_focus || intake.revenue_mix}`)
+  if (intake.hiring_plan) lines.push(`Hiring Plan: ${intake.hiring_plan}`)
+  if (intake.territory_model) lines.push(`Territory Model: ${intake.territory_model}`)
+  if (intake.selling_model || intake.deal_involvement) lines.push(`Selling Model: ${intake.selling_model || intake.deal_involvement}`)
+  if (intake.payout_frequency) lines.push(`Payout Frequency: ${intake.payout_frequency}`)
+  if (intake.quota_maturity || intake.quota_confidence) lines.push(`Quota Maturity: ${intake.quota_maturity || intake.quota_confidence}`)
+  if (intake.target_revenue) lines.push(`Revenue Target: ${intake.target_revenue}`)
+  if (intake.budget_constraint) lines.push(`Budget Constraint: ${intake.budget_constraint}`)
+
+  return `COMPANY SUMMARY (key inputs for reference; all decisions already reflected in the analysis output above):\n${lines.join('\n')}`
 }
 
 

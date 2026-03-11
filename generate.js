@@ -1,15 +1,22 @@
-// CompFrame AI Pipeline - Decomposed Analysis (Railway)
+// CompFrame AI Pipeline v4 - Sequential Execution (Railway)
 // No timeout constraints. Runs the full pipeline:
 //   Phase A: Strategic Foundation (qualitative decisions)
 //   Phase B: Numerical Contract (all numbers locked)
 //   Phase C: Rationale & Operations (explanations + operational design)
 //   Validation + Auto-Fix
-//   5 Parallel Group Calls (formatting into deliverables)
+//   5 SEQUENTIAL Group Calls (formatting into deliverables)
 //   Group Validation + Force-Align
 //   Merge + Save to Supabase
+//
+// v4 changes:
+// - Groups run SEQUENTIALLY instead of in parallel to avoid rate limits
+//   and reduce peak token usage
+// - Compact JSON serialization in prompts (no pretty-printing)
+// - Token estimation and auto-reduction for oversized requests
+// - Better error propagation and status reporting
 
 import { createClient } from '@supabase/supabase-js'
-import { callClaudeJSON } from './lib/claude.js'
+import { callClaudeJSON, estimateTokens, checkContextFit } from './lib/claude.js'
 import { buildPhaseASystemPrompt, buildPhaseAUserPrompt } from './lib/phase-a-prompt.js'
 import { buildPhaseBSystemPrompt, buildPhaseBUserPrompt } from './lib/phase-b-prompt.js'
 import { buildPhaseCSystemPrompt, buildPhaseCUserPrompt } from './lib/phase-c-prompt.js'
@@ -41,16 +48,11 @@ async function updateStatus(supabase, planId, stage, detail) {
 
 /**
  * Estimate plan count from intake data.
- * Tries multiple approaches since _plan_count metadata may not be set.
  */
 function estimatePlanCount(intake) {
-  // 1. Explicit metadata
   if (intake._plan_count && intake._plan_count > 0) return intake._plan_count
-
-  // 2. Combo details array
   if (intake._combo_details?.length > 0) return intake._combo_details.length
 
-  // 3. Count from role_types field (common intake pattern)
   let roleCount = 1
   if (typeof intake.role_types === 'string' && intake.role_types.length > 0) {
     roleCount = intake.role_types.split(',').map(s => s.trim()).filter(Boolean).length
@@ -60,7 +62,6 @@ function estimatePlanCount(intake) {
     roleCount = intake.roles.length
   }
 
-  // 4. Count segments
   let segmentCount = 1
   if (typeof intake.segments === 'string' && intake.segments.length > 0) {
     segmentCount = intake.segments.split(',').map(s => s.trim()).filter(Boolean).length
@@ -74,11 +75,38 @@ function estimatePlanCount(intake) {
 }
 
 /**
- * Token budgets. Set to max supported output (64,000) for all phases.
- * Claude stops when done; you only pay for tokens actually generated.
+ * Token budgets scaled by plan count.
+ * For small plans (1-3 roles): standard budgets.
+ * For larger plans: increase phase budgets, cap group budgets.
  */
-function getTokenBudgets() {
-  return { phaseA: 64000, phaseB: 64000, phaseC: 64000, groupA: 64000, groupE: 64000 }
+function getTokenBudgets(planCount) {
+  // Base budgets
+  const budgets = {
+    phaseA: 16384,
+    phaseB: 32000,
+    phaseC: 32000,
+    groupDefault: 8192,
+    groupA: 16384,
+    groupE: 16384,
+  }
+
+  // Scale up for multi-role plans
+  if (planCount > 3) {
+    budgets.phaseA = 32000
+    budgets.phaseB = 48000
+    budgets.phaseC = 48000
+    budgets.groupA = 32000
+    budgets.groupE = 32000
+  }
+
+  if (planCount > 8) {
+    budgets.phaseB = 64000
+    budgets.phaseC = 64000
+    budgets.groupA = 48000
+    budgets.groupE = 48000
+  }
+
+  return budgets
 }
 
 /**
@@ -87,7 +115,11 @@ function getTokenBudgets() {
  */
 async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, model, supabase, planId, stage, detail, retryDetail }) {
   await updateStatus(supabase, planId, stage, detail)
-  console.log(`[Pipeline] Starting ${name} (maxTokens: ${maxTokens})`)
+
+  // Log token estimates
+  const fit = checkContextFit(systemPrompt, userPrompt, maxTokens)
+  console.log(`[Pipeline] Starting ${name} (~${fit.inputTokens} input tokens, ${maxTokens} output budget, ${fit.utilizationPct}% context utilization)`)
+
   const start = Date.now()
 
   let output
@@ -108,7 +140,9 @@ async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, mod
       console.error(`[Pipeline] ${name} response preview:`, err.responseText.substring(0, 500))
     }
 
-    const isOverload = err.statusCode === 529 || err.statusCode === 429 || err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
+    const isOverload = err.statusCode === 529 || err.statusCode === 429 ||
+      err.message?.includes('529') || err.message?.includes('overload') || err.message?.includes('rate')
+
     const retryModel = isOverload ? MODEL_FALLBACK : model
     activeModel = retryModel
     console.log(`[Pipeline] Retrying ${name} with model ${retryModel} (overload: ${isOverload})`)
@@ -126,7 +160,7 @@ async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, mod
       })
     } catch (retryErr) {
       console.error(`[Pipeline] ${name} retry failed:`, retryErr.message)
-      throw new Error(`${name} failed after retry`)
+      throw new Error(`${name} failed after retry: ${retryErr.message}`)
     }
   }
 
@@ -134,6 +168,7 @@ async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, mod
   console.log(`[Pipeline] ${name} complete in ${(ms / 1000).toFixed(1)}s`)
   return { output, activeModel, ms }
 }
+
 
 export async function runPipeline(intake, planId) {
   const apiKey = process.env.ANTHROPIC_API_KEY
@@ -157,17 +192,11 @@ export async function runPipeline(intake, planId) {
       planCount,
     }
 
-    // Debug: log intake structure for plan count troubleshooting
-    const intakeKeys = Object.keys(intake).filter(k => !k.startsWith('_')).slice(0, 30)
-    console.log(`[Pipeline] Intake keys (first 30): ${intakeKeys.join(', ')}`)
-    console.log(`[Pipeline] _plan_count: ${intake._plan_count}, combos: ${combos.length}, roles array: ${Array.isArray(intake.roles) ? intake.roles.length : 'N/A'}`)
-    const roleKeyMatches = Object.keys(intake).filter(k => /^role_\d+/.test(k))
-    console.log(`[Pipeline] Role-like keys: ${roleKeyMatches.length > 0 ? roleKeyMatches.join(', ') : 'none'}`)
-
     console.log(`[Pipeline] Plan count: ${metadata.planCount}, multi-segment: ${metadata.isMultiSegment}, variants: ${metadata.hasVariants}`)
+    console.log(`[Pipeline] Intake context: ${intakeContext.length} chars (~${estimateTokens(intakeContext)} tokens)`)
 
-    const tokenBudgets = getTokenBudgets()
-    console.log(`[Pipeline] Token budgets: all phases 64000 (max output)`)
+    const tokenBudgets = getTokenBudgets(planCount)
+    console.log(`[Pipeline] Token budgets: phaseA=${tokenBudgets.phaseA}, phaseB=${tokenBudgets.phaseB}, phaseC=${tokenBudgets.phaseC}, groupA=${tokenBudgets.groupA}`)
 
     // ============================================================
     // STEP 2: Phase A -- Strategic Foundation
@@ -266,10 +295,8 @@ export async function runPipeline(intake, planId) {
 
     const phaseCOutput = phaseC.output
 
-    // Validate Phase C has required fields
     if (!phaseCOutput?.role_analysis || !phaseCOutput?.operational_analysis) {
       console.warn('[Pipeline] Phase C missing some fields:', Object.keys(phaseCOutput || {}))
-      // Phase C is less critical; we can proceed with partial output
     }
 
     const totalAnalysisMs = phaseA.ms + phaseB.ms + phaseC.ms
@@ -277,7 +304,6 @@ export async function runPipeline(intake, planId) {
 
     // ============================================================
     // STEP 6: Merge phase outputs into unified analysisOutput
-    // (must match the shape that group prompts expect)
     // ============================================================
     const analysisOutput = {
       numerical_contract: phaseBOutput.numerical_contract,
@@ -290,67 +316,52 @@ export async function runPipeline(intake, planId) {
     }
 
     // ============================================================
-    // STEP 7: Parallel group generation
+    // STEP 7: SEQUENTIAL group generation
+    // Groups run one at a time to avoid rate limits and reduce
+    // peak token usage. Each group only receives the analysis
+    // sections it needs (trimming happens in group-prompts.js).
     // ============================================================
     await updateStatus(supabase, planId, 'generating', 'Building plan deliverables...')
 
     const groupIds = Object.keys(GROUP_DEFINITIONS)
-    console.log(`[Pipeline] Starting ${groupIds.length} parallel group calls`)
+    console.log(`[Pipeline] Starting ${groupIds.length} SEQUENTIAL group calls`)
     const groupStart = Date.now()
 
-    // Override group token limits for large orgs
-    const groupTokenOverrides = {
-      A: tokenBudgets.groupA,
-      E: tokenBudgets.groupE,
+    const successfulGroups = {}
+    const failedGroupIds = []
+
+    for (const groupId of groupIds) {
+      const group = GROUP_DEFINITIONS[groupId]
+      const maxTokens = (groupId === 'A' ? tokenBudgets.groupA : groupId === 'E' ? tokenBudgets.groupE : tokenBudgets.groupDefault) || group.maxTokens
+      const groupStartTime = Date.now()
+
+      await updateStatus(supabase, planId, 'generating', `Building ${group.name} (${groupIds.indexOf(groupId) + 1}/${groupIds.length})...`)
+
+      try {
+        const result = await callClaudeJSON({
+          systemPrompt: group.buildSystemPrompt(),
+          userPrompt: group.buildUserPrompt(intakeContext, analysisOutput),
+          apiKey,
+          maxTokens,
+          model: activeModel,
+        })
+
+        const groupMs = Date.now() - groupStartTime
+        console.log(`[Pipeline] Group ${groupId} (${group.name}) complete in ${(groupMs / 1000).toFixed(1)}s`)
+        successfulGroups[groupId] = result
+      } catch (err) {
+        const groupMs = Date.now() - groupStartTime
+        console.error(`[Pipeline] Group ${groupId} (${group.name}) failed after ${(groupMs / 1000).toFixed(1)}s:`, err.message)
+        failedGroupIds.push(groupId)
+      }
     }
-
-    const groupResults = await Promise.allSettled(
-      groupIds.map(async (groupId) => {
-        const group = GROUP_DEFINITIONS[groupId]
-        const groupStartTime = Date.now()
-        const maxTokens = groupTokenOverrides[groupId] || group.maxTokens
-
-        try {
-          const result = await callClaudeJSON({
-            systemPrompt: group.buildSystemPrompt(),
-            userPrompt: group.buildUserPrompt(intakeContext, analysisOutput),
-            apiKey,
-            maxTokens,
-            model: activeModel,
-          })
-
-          const groupMs = Date.now() - groupStartTime
-          console.log(`[Pipeline] Group ${groupId} (${group.name}) complete in ${(groupMs / 1000).toFixed(1)}s`)
-          return { groupId, result }
-        } catch (err) {
-          const groupMs = Date.now() - groupStartTime
-          console.error(`[Pipeline] Group ${groupId} (${group.name}) failed after ${(groupMs / 1000).toFixed(1)}s:`, err.message)
-          throw { groupId, error: err }
-        }
-      })
-    )
 
     const groupMs = Date.now() - groupStart
     console.log(`[Pipeline] All groups complete in ${(groupMs / 1000).toFixed(1)}s`)
 
     // ============================================================
-    // STEP 8: Collect results, retry failures
+    // STEP 8: Retry failed groups once
     // ============================================================
-    const successfulGroups = {}
-    const failedGroupIds = []
-
-    for (const result of groupResults) {
-      if (result.status === 'fulfilled') {
-        const { groupId, result: groupOutput } = result.value
-        successfulGroups[groupId] = groupOutput
-      } else {
-        const failedId = result.reason?.groupId || 'unknown'
-        failedGroupIds.push(failedId)
-      }
-    }
-
-    console.log(`[Pipeline] ${Object.keys(successfulGroups).length}/${groupIds.length} groups succeeded`)
-
     if (failedGroupIds.length > 0) {
       console.log(`[Pipeline] Retrying ${failedGroupIds.length} failed groups: ${failedGroupIds.join(', ')}`)
       await updateStatus(supabase, planId, 'generating', `Retrying ${failedGroupIds.length} section(s)...`)
@@ -358,7 +369,7 @@ export async function runPipeline(intake, planId) {
       for (const groupId of failedGroupIds) {
         const group = GROUP_DEFINITIONS[groupId]
         if (!group) continue
-        const maxTokens = groupTokenOverrides[groupId] || group.maxTokens
+        const maxTokens = (groupId === 'A' ? tokenBudgets.groupA : groupId === 'E' ? tokenBudgets.groupE : tokenBudgets.groupDefault) || group.maxTokens
 
         try {
           const retryResult = await callClaudeJSON({
@@ -405,7 +416,7 @@ export async function runPipeline(intake, planId) {
     // STEP 11: Save to Supabase
     // ============================================================
     const totalMs = Date.now() - pipelineStart
-    console.log(`[Pipeline] Total time: ${(totalMs / 1000).toFixed(1)}s (analysis phases: ${(totalAnalysisMs / 1000).toFixed(1)}s, groups: ${(groupMs / 1000).toFixed(1)}s)`)
+    console.log(`[Pipeline] Total time: ${(totalMs / 1000).toFixed(1)}s (analysis: ${(totalAnalysisMs / 1000).toFixed(1)}s, groups: ${(groupMs / 1000).toFixed(1)}s)`)
     console.log(`[Pipeline] Groups completed: ${recommendations._groups_completed.join(', ')}`)
     if (recommendations._groups_failed.length > 0) {
       console.warn(`[Pipeline] Groups failed: ${recommendations._groups_failed.join(', ')}`)
@@ -507,7 +518,7 @@ function mergeRecommendations(analysisOutput, groups) {
   }
 
   recs._numerical_contract = contract
-  recs._pipeline_version = 3
+  recs._pipeline_version = 4
   recs._groups_completed = Object.keys(groups)
   recs._groups_failed = Object.keys(GROUP_DEFINITIONS).filter(g => !groups[g])
 

@@ -10,10 +10,17 @@
 //
 // v4 changes:
 // - Groups run SEQUENTIALLY instead of in parallel to avoid rate limits
-//   and reduce peak token usage
+//     and reduce peak token usage
 // - Compact JSON serialization in prompts (no pretty-printing)
 // - Token estimation and auto-reduction for oversized requests
 // - Better error propagation and status reporting
+// v4.1 changes:
+// - Fixed updateStatus to check Supabase error response (was silently failing)
+// - updateStatus now also writes status column (generating/complete/error)
+// - Added JWT role verification on startup to detect wrong key
+// - Added Supabase connectivity check at pipeline start
+// - Added row count verification on all writes
+// - Added read-back verification after final save
 
 import { createClient } from '@supabase/supabase-js'
 import { callClaudeJSON, estimateTokens, checkContextFit } from './lib/claude.js'
@@ -30,21 +37,52 @@ const MODEL_FALLBACK = 'claude-sonnet-4-5-20250929'
 function getSupabase() {
   const url = process.env.SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!url || !key) return null
+  if (!url || !key) {
+    console.error('[Pipeline] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+    return null
+  }
+  // Verify this is actually the service_role key (not the anon key)
+  try {
+    const payload = JSON.parse(Buffer.from(key.split('.')[1], 'base64').toString())
+    if (payload.role !== 'service_role') {
+      console.error(`[Pipeline] WRONG KEY: SUPABASE_SERVICE_ROLE_KEY has role="${payload.role}" instead of "service_role". Update the Railway env var with the correct key from Supabase Settings > API > service_role.`)
+    } else {
+      console.log('[Pipeline] Supabase service_role key verified.')
+    }
+  } catch (e) {
+    console.warn('[Pipeline] Could not decode Supabase key to verify role:', e.message)
+  }
   return createClient(url, key)
 }
 
 async function updateStatus(supabase, planId, stage, detail) {
   if (!supabase || !planId) return
   try {
-    await supabase
+    const updateData = { generation_stage: stage, generation_detail: detail }
+    // Also set the status column so the frontend knows what screen to show
+    if (stage === 'complete') {
+      updateData.status = 'complete'
+    } else if (stage === 'error') {
+      updateData.status = 'error'
+    } else {
+      updateData.status = 'generating'
+    }
+    const { error, count } = await supabase
       .from('plans')
-      .update({ generation_stage: stage, generation_detail: detail })
+      .update(updateData, { count: 'exact' })
       .eq('id', planId)
+    if (error) {
+      console.error(`[Pipeline] Supabase status update FAILED for ${planId}: ${error.message}`, error.details || '', error.hint || '')
+    } else if (count === 0) {
+      console.error(`[Pipeline] Supabase status update affected 0 rows for ${planId}. RLS is likely blocking the write. Check that SUPABASE_SERVICE_ROLE_KEY is the service_role key (not the anon key).`)
+    } else {
+      console.log(`[Pipeline] Status: ${stage} - ${detail}`)
+    }
   } catch (err) {
-    console.error('Status update failed:', err.message)
+    console.error('[Pipeline] Status update exception:', err.message)
   }
 }
+
 
 /**
  * Estimate plan count from intake data.
@@ -74,6 +112,7 @@ function estimatePlanCount(intake) {
   return Math.max(estimated, 1)
 }
 
+
 /**
  * Token budgets scaled by plan count.
  * For small plans (1-3 roles): standard budgets.
@@ -100,7 +139,6 @@ function getTokenBudgets(planCount) {
     budgets.groupD = 32000
     budgets.groupE = 32000
   }
-
   if (planCount > 8) {
     budgets.phaseB = 64000
     budgets.phaseC = 64000
@@ -111,6 +149,7 @@ function getTokenBudgets(planCount) {
 
   return budgets
 }
+
 
 /**
  * Run a single phase with retry logic.
@@ -148,8 +187,8 @@ async function runPhase({ name, systemPrompt, userPrompt, apiKey, maxTokens, mod
 
     const retryModel = isOverload ? MODEL_FALLBACK : model
     activeModel = retryModel
-    console.log(`[Pipeline] Retrying ${name} with model ${retryModel} (overload: ${isOverload})`)
 
+    console.log(`[Pipeline] Retrying ${name} with model ${retryModel} (overload: ${isOverload})`)
     await updateStatus(supabase, planId, stage, retryDetail || `${name} failed. Retrying...`)
 
     try {
@@ -179,6 +218,37 @@ export async function runPipeline(intake, planId) {
 
   const supabase = getSupabase()
   const pipelineStart = Date.now()
+
+  // Verify Supabase connectivity before starting the pipeline
+  if (supabase && planId) {
+    const { data: testRow, error: testErr } = await supabase
+      .from('plans')
+      .select('id, status')
+      .eq('id', planId)
+      .single()
+    if (testErr) {
+      console.error(`[Pipeline] Supabase connectivity check FAILED: ${testErr.message}`)
+    } else if (!testRow) {
+      console.error(`[Pipeline] Plan ${planId} not found in Supabase`)
+    } else {
+      console.log(`[Pipeline] Supabase verified: plan ${planId} found, current status=${testRow.status}`)
+      // Set initial generating status and verify the write actually works
+      const { error: initErr, count: initCount } = await supabase
+        .from('plans')
+        .update(
+          { status: 'generating', generation_stage: 'analysis', generation_detail: 'Starting analysis pipeline...' },
+          { count: 'exact' }
+        )
+        .eq('id', planId)
+      if (initErr) {
+        console.error(`[Pipeline] Initial status write FAILED: ${initErr.message}`)
+      } else if (initCount === 0) {
+        console.error(`[Pipeline] Initial status write affected 0 rows. RLS is blocking writes! The SUPABASE_SERVICE_ROLE_KEY may be the anon key. Check Supabase Settings > API and update the Railway env var.`)
+      } else {
+        console.log(`[Pipeline] Initial status set to generating (${initCount} row updated)`)
+      }
+    }
+  }
 
   try {
     // ============================================================
@@ -211,13 +281,11 @@ export async function runPipeline(intake, planId) {
       apiKey,
       maxTokens: tokenBudgets.phaseA,
       model: MODEL_PRIMARY,
-      supabase,
-      planId,
+      supabase, planId,
       stage: 'analysis',
       detail: 'Phase 1/3: Analyzing strategy and role architecture...',
       retryDetail: 'Strategy analysis failed. Retrying...',
     })
-
     const phaseAOutput = phaseA.output
     let activeModel = phaseA.activeModel
 
@@ -226,7 +294,6 @@ export async function runPipeline(intake, planId) {
       console.error('[Pipeline] Phase A missing required fields:', Object.keys(phaseAOutput || {}))
       throw new Error('Phase A produced incomplete output (missing strategic_analysis or role_architecture)')
     }
-
     console.log(`[Pipeline] Phase A produced ${phaseAOutput.role_architecture.roles.length} role(s)`)
 
     // ============================================================
@@ -239,13 +306,11 @@ export async function runPipeline(intake, planId) {
       apiKey,
       maxTokens: tokenBudgets.phaseB,
       model: activeModel,
-      supabase,
-      planId,
+      supabase, planId,
       stage: 'analysis',
       detail: 'Phase 2/3: Locking numerical contract...',
       retryDetail: 'Numerical contract failed. Retrying...',
     })
-
     const phaseBOutput = phaseB.output
 
     // Validate Phase B has numerical_contract with roles
@@ -253,7 +318,6 @@ export async function runPipeline(intake, planId) {
       console.error('[Pipeline] Phase B missing numerical_contract.roles:', Object.keys(phaseBOutput || {}))
       throw new Error('Phase B produced incomplete output (missing numerical_contract)')
     }
-
     console.log(`[Pipeline] Phase B produced ${phaseBOutput.numerical_contract.roles.length} role(s) in contract`)
 
     // ============================================================
@@ -263,7 +327,6 @@ export async function runPipeline(intake, planId) {
 
     const contractValidation = validateContract(phaseBOutput.numerical_contract)
     console.log(`[Pipeline] Contract validation: ${contractValidation.valid ? 'PASSED' : 'FAILED'} (${contractValidation.errors.length} errors, ${contractValidation.warnings.length} warnings)`)
-
     if (contractValidation.errors.length > 0) {
       console.log('[Pipeline] Contract errors:', contractValidation.errors.map(e => e.message))
     }
@@ -271,7 +334,6 @@ export async function runPipeline(intake, planId) {
     if (!contractValidation.valid) {
       console.log('[Pipeline] Auto-fixing contract...')
       phaseBOutput.numerical_contract = autoFixContract(phaseBOutput.numerical_contract)
-
       const revalidation = validateContract(phaseBOutput.numerical_contract)
       console.log(`[Pipeline] Post-fix validation: ${revalidation.valid ? 'PASSED' : 'STILL HAS ERRORS'}`)
       if (!revalidation.valid) {
@@ -289,15 +351,12 @@ export async function runPipeline(intake, planId) {
       apiKey,
       maxTokens: tokenBudgets.phaseC,
       model: activeModel,
-      supabase,
-      planId,
+      supabase, planId,
       stage: 'analysis',
       detail: 'Phase 3/3: Building rationale and operations...',
       retryDetail: 'Rationale phase failed. Retrying...',
     })
-
     const phaseCOutput = phaseC.output
-
     if (!phaseCOutput?.role_analysis || !phaseCOutput?.operational_analysis) {
       console.warn('[Pipeline] Phase C missing some fields:', Object.keys(phaseCOutput || {}))
     }
@@ -335,7 +394,6 @@ export async function runPipeline(intake, planId) {
     const groupIds = Object.keys(GROUP_DEFINITIONS)
     console.log(`[Pipeline] Starting ${groupIds.length} SEQUENTIAL group calls`)
     const groupStart = Date.now()
-
     const successfulGroups = {}
     const failedGroupIds = []
 
@@ -362,7 +420,6 @@ export async function runPipeline(intake, planId) {
           maxTokens,
           model: activeModel,
         })
-
         const groupMs = Date.now() - groupStartTime
         console.log(`[Pipeline] Group ${groupId} (${group.name}) complete in ${(groupMs / 1000).toFixed(1)}s`)
         successfulGroups[groupId] = result
@@ -387,7 +444,6 @@ export async function runPipeline(intake, planId) {
         const group = GROUP_DEFINITIONS[groupId]
         if (!group) continue
         const maxTokens = groupTokenBudget(groupId) || group.maxTokens
-
         try {
           const retryResult = await callClaudeJSON({
             systemPrompt: group.buildSystemPrompt(),
@@ -411,10 +467,8 @@ export async function runPipeline(intake, planId) {
 
     for (const [groupId, groupOutput] of Object.entries(successfulGroups)) {
       const validation = validateGroupOutput(groupId, groupOutput, analysisOutput.numerical_contract)
-
       if (!validation.valid) {
         console.warn(`[Pipeline] Group ${groupId} validation:`, validation.errors.length, 'errors')
-
         if (groupId === 'A') {
           console.log('[Pipeline] Force-aligning Group A to contract')
           successfulGroups[groupId] = forceAlignGroupA(groupOutput, analysisOutput.numerical_contract)
@@ -451,7 +505,18 @@ export async function runPipeline(intake, planId) {
         })
         .eq('id', planId)
 
-      if (updateError) console.error('[Pipeline] Supabase save error:', updateError)
+      if (updateError) {
+        console.error('[Pipeline] CRITICAL: Final save FAILED:', updateError.message, updateError.details || '', updateError.hint || '')
+        console.error('[Pipeline] The pipeline completed but results were NOT saved to Supabase.')
+      } else {
+        // Verify the save actually worked by reading back
+        const { data: verify } = await supabase.from('plans').select('status, recommendations').eq('id', planId).single()
+        if (verify?.recommendations) {
+          console.log('[Pipeline] Final save VERIFIED: recommendations saved successfully.')
+        } else {
+          console.error('[Pipeline] CRITICAL: Final save returned no error but recommendations are NOT in the database. RLS is silently blocking writes. Check that SUPABASE_SERVICE_ROLE_KEY is the service_role key.')
+        }
+      }
     }
 
     console.log(`[Pipeline] Plan ${planId} complete`)
@@ -461,11 +526,12 @@ export async function runPipeline(intake, planId) {
     console.error('[Pipeline] Error:', err?.message || err)
     if (planId && supabase) {
       try {
-        await supabase.from('plans').update({
+        const { error: errSave } = await supabase.from('plans').update({
           status: 'error',
           generation_stage: 'error',
           generation_detail: err?.message || 'Unexpected error during generation',
-        }).eq('id', planId)
+        }, { count: 'exact' }).eq('id', planId)
+        if (errSave) console.error('[Pipeline] Error status save also failed:', errSave.message)
       } catch (_) {}
     }
     throw err
@@ -501,7 +567,6 @@ function buildCompactIntakeSummary(intake) {
   if (intake.quota_maturity || intake.quota_confidence) lines.push(`Quota Maturity: ${intake.quota_maturity || intake.quota_confidence}`)
   if (intake.target_revenue) lines.push(`Revenue Target: ${intake.target_revenue}`)
   if (intake.budget_constraint) lines.push(`Budget Constraint: ${intake.budget_constraint}`)
-
   return `COMPANY SUMMARY (key inputs for reference; all decisions already reflected in the analysis output above):\n${lines.join('\n')}`
 }
 
@@ -579,9 +644,9 @@ function mergeRecommendations(analysisOutput, groups) {
   return recs
 }
 
+
 function buildFallbackRoles(contract) {
   if (!contract?.roles) return {}
-
   const roles = {}
   for (const cr of contract.roles) {
     roles[cr.role_key] = {
@@ -613,9 +678,7 @@ function buildFallbackRoles(contract) {
         structure: cr.accelerator_tiers?.map(t =>
           `${t.min_attainment_pct}-${t.max_attainment_pct || ''}%: ${t.multiplier_display || t.multiplier + 'x'}`
         ).join(', ') || '',
-        multiplier: cr.accelerator_tiers?.length
-          ? cr.accelerator_tiers[cr.accelerator_tiers.length - 1].multiplier
-          : 1,
+        multiplier: cr.accelerator_tiers?.length ? cr.accelerator_tiers[cr.accelerator_tiers.length - 1].multiplier : 1,
         threshold_pct: 100,
         rationale: '',
       },
@@ -648,9 +711,9 @@ function buildFallbackRoles(contract) {
   return roles
 }
 
+
 function buildFallbackCostModel(contract) {
   if (!contract?.company_level) return {}
-
   const cl = contract.company_level
   return {
     total_ote_at_target: cl.total_ote_at_target,

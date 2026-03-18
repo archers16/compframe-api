@@ -594,32 +594,28 @@ function mergeRecommendations(analysisOutput, groups) {
     recs.baseline_comparison = groups.B.baseline_comparison || {}
   }
 
-  // Group C: operations
+  // Group C: operations (trimmed for Phase 1)
   if (groups.C) {
     recs.crediting_rules = groups.C.crediting_rules || {}
     recs.quota_methodology = groups.C.quota_methodology || {}
     recs.governance = groups.C.governance || {}
-    recs.payout_mechanics = groups.C.payout_mechanics || {}
     recs.cross_role_alignment = groups.C.cross_role_alignment || {}
-    recs.spif_suggestions = groups.C.spif_suggestions || []
   }
 
-  // Group D: diagnostics
+  // Group D: diagnostics (trimmed: no anti_patterns)
   if (groups.D) {
-    recs.anti_patterns_detected = groups.D.anti_patterns_detected || []
     recs.scenarios = groups.D.scenarios || []
     recs.global_warnings = groups.D.global_warnings || []
     recs.assumptions = groups.D.assumptions || []
   }
 
-  // Group E: communication + slides + metadata
+  // Group E: communication + slides + metadata (trimmed: no transition_plan)
   if (groups.E) {
     recs.plan_name = groups.E.plan_name || analysisOutput.strategic_analysis?.plan_name || 'Compensation Plan'
     recs.summary = groups.E.summary || analysisOutput.strategic_analysis?.summary || ''
     recs.confidence_level = groups.E.confidence_level || analysisOutput.strategic_analysis?.confidence_level || 'Medium'
     recs.confidence_note = groups.E.confidence_note || analysisOutput.strategic_analysis?.confidence_note || ''
     recs.implementation = groups.E.implementation || {}
-    recs.transition_plan = groups.E.transition_plan || {}
     recs.slide_content = groups.E.slide_content || {}
   } else {
     recs.plan_name = analysisOutput.strategic_analysis?.plan_name || 'Compensation Plan'
@@ -633,7 +629,7 @@ function mergeRecommendations(analysisOutput, groups) {
   }
 
   recs._numerical_contract = contract
-  recs._pipeline_version = 4
+  recs._pipeline_version = 5
   recs._groups_completed = Object.keys(groups)
   recs._groups_failed = Object.keys(GROUP_DEFINITIONS).filter(g => !groups[g])
 
